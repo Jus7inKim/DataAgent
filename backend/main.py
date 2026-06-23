@@ -37,20 +37,11 @@ API_VERSION = "2024-05-01-preview"
 POLL_INTERVAL_SEC = 2
 POLL_TIMEOUT_SEC = 300
 
-# 분할 출력(방안 B) 설정: 한 번에 출력 요청할 행 수와 최대 배치 수
-BATCH_SIZE = int(os.getenv("BATCH_SIZE", "25"))
-MAX_BATCHES = int(os.getenv("MAX_BATCHES", "20"))
-
-FIRST_BATCH_INSTRUCTION = (
-    "\n\n[출력 규칙] 위 질문의 결과를 한 행도 빠짐없이 일관된 정렬 순서로 반환합니다. "
-    "지금은 그중 처음 {n}건만 마크다운 표(헤더 포함)로만 출력하세요. "
-    "표 이외의 설명, 요약, 생략 표시는 절대 넣지 마세요."
-)
-
-NEXT_BATCH_INSTRUCTION = (
-    "직전 질문과 완전히 동일한 결과·정렬 순서를 기준으로, "
-    "{start}번째 행부터 {end}번째 행까지를 이어서 마크다운 표(헤더 포함)로만 출력하세요. "
-    "표 이외의 설명·생략 표시는 넣지 말고, 해당 구간에 더 이상 데이터가 없으면 정확히 '없음' 한 단어만 답하세요."
+# 결과 요청 지침: 에이전트가 전체 행을 빠짐없이 반환하도록 유도
+FULL_RESULT_INSTRUCTION = (
+    "\n\n[출력 규칙] 위 질문의 결과를 한 행도 빠짐없이, 요약·생략·표본 추출 없이 "
+    "전부 반환하세요. 결과 행 수를 임의로 제한하지 말고 질문에서 요청한 건수를 그대로 "
+    "조회하세요."
 )
 
 
@@ -201,48 +192,28 @@ def call_data_agent(session_id: str, question: str) -> dict:
     thread_id = sess["thread_id"]
     assistant_id = sess["assistant_id"]
 
-    # ── 방안 B: 분할 출력 후 병합 ──────────────────────────────
-    first_prompt = question + FIRST_BATCH_INSTRUCTION.format(n=BATCH_SIZE)
-    first_text, first_run_id = _ask_once(client, thread_id, assistant_id, first_prompt)
+    # 1) 질문을 1회 실행 (전체 결과 반환 유도)
+    prompt = question + FULL_RESULT_INSTRUCTION
+    text, run_id = _ask_once(client, thread_id, assistant_id, prompt)
 
-    frames = []
-    df0 = parse_output_to_df(first_text)
-    if df0 is not None and len(df0) > 0:
-        frames.append(df0)
+    # 2) 후보 프레임 수집 — 가장 행이 많은(전체에 가까운) 결과를 채택
+    candidates = []
 
-    if not frames:
-        for item in extract_query_results(client, thread_id, first_run_id):
-            d = parse_output_to_df(item.get("output"))
-            if d is not None and len(d) > 0:
-                frames.append(d)
+    # 2-a) 툴 호출의 원본 쿼리 결과(전체 행)를 최우선 후보로 사용
+    for item in extract_query_results(client, thread_id, run_id):
+        d = parse_output_to_df(item.get("output"))
+        if d is not None and len(d) > 0:
+            candidates.append(d)
 
-    if frames and len(frames[-1]) >= BATCH_SIZE:
-        for b in range(1, MAX_BATCHES):
-            start = b * BATCH_SIZE + 1
-            end = (b + 1) * BATCH_SIZE
-            text, _ = _ask_once(
-                client,
-                thread_id,
-                assistant_id,
-                NEXT_BATCH_INSTRUCTION.format(start=start, end=end),
-            )
-            if "없음" in text and "|" not in text:
-                break
-            df = parse_output_to_df(text)
-            if df is None or len(df) == 0:
-                break
-            frames.append(df)
-            if len(df) < BATCH_SIZE:
-                break
+    # 2-b) 응답 텍스트(JSON/마크다운 표)도 후보로 추가
+    df_text = parse_output_to_df(text)
+    if df_text is not None and len(df_text) > 0:
+        candidates.append(df_text)
+    df_md = _markdown_table_to_df(text)
+    if df_md is not None and len(df_md) > 0:
+        candidates.append(df_md)
 
-    combined = None
-    if frames:
-        try:
-            combined = pd.concat(frames, ignore_index=True)
-            combined = combined.drop_duplicates(ignore_index=True)
-        except Exception as e:  # noqa: BLE001
-            logger.warning("배치 병합 실패: %s", e)
-            combined = frames[0]
+    combined = max(candidates, key=len) if candidates else None
 
     if combined is not None and len(combined) > 0:
         payload = df_to_payload(combined)
@@ -252,17 +223,7 @@ def call_data_agent(session_id: str, question: str) -> dict:
             "rows": payload["rows"],
         }
 
-    # 표가 없으면 텍스트 답변에서 마크다운 표 폴백 파싱
-    fallback_df = _markdown_table_to_df(first_text)
-    if fallback_df is not None and len(fallback_df) > 0:
-        payload = df_to_payload(fallback_df)
-        return {
-            "text": f"조회 결과 {len(fallback_df)}건을 표로 표시합니다.",
-            "columns": payload["columns"],
-            "rows": payload["rows"],
-        }
-
-    return {"text": first_text, "columns": [], "rows": []}
+    return {"text": text, "columns": [], "rows": []}
 
 
 def extract_query_results(client, thread_id, run_id):
