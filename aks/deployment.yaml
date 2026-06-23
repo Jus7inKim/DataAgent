@@ -1,0 +1,51 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fabric-data-agent
+  namespace: fabric-data-agent
+  labels:
+    app: fabric-data-agent
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: fabric-data-agent
+  template:
+    metadata:
+      labels:
+        app: fabric-data-agent
+        # Workload Identity Webhook이 AZURE_* 환경변수 자동 주입
+        azure.workload.identity/use: "true"
+    spec:
+      serviceAccountName: fabric-data-agent-sa
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+      containers:
+        - name: fabric-data-agent
+          # TODO: <ACR_LOGIN_SERVER> 를 실제 ACR 주소로 교체
+          image: mskraksclustercr.azurecr.io/fabric-data-agent:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8501
+              name: http
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "256Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+          livenessProbe:
+            httpGet:
+              path: /_stcore/health
+              port: 8501
+            initialDelaySeconds: 20
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /_stcore/health
+              port: 8501
+            initialDelaySeconds: 10
+            periodSeconds: 10

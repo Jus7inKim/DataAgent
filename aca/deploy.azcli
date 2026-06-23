@@ -1,0 +1,126 @@
+#!/usr/bin/env bash
+# ============================================================
+# Fabric Data Agent - Azure Container Apps (ACA) 배포 스크립트
+#   - 신규 Resource Group 생성
+#   - 기존 UAMI(Fabric 권한 보유) / ACR 재사용
+#   - ACA 자동 생성 URL(FQDN) 출력
+# ============================================================
+set -euo pipefail
+
+# ── 변수 ────────────────────────────────────────────────────
+SUBSCRIPTION_ID="85065b6a-4de1-4e07-a857-c41de5eadee8"
+LOCATION="koreacentral"
+
+# 신규 리소스 그룹 (ACA 전용)
+RESOURCE_GROUP="rg-data-agent-rg"
+ENVIRONMENT="mskr-aca-env"
+APP_NAME="fabric-data-agent"
+TARGET_PORT=8501
+
+# 기존 ACR 재사용
+ACR_NAME="mskraksclustercr"
+ACR_LOGIN_SERVER="${ACR_NAME}.azurecr.io"
+IMAGE_NAME="fabric-data-agent"
+IMAGE_TAG="latest"
+IMAGE_REF="${ACR_LOGIN_SERVER}/${IMAGE_NAME}:${IMAGE_TAG}"
+
+# 기존 User-Assigned Managed Identity 재사용 (Fabric API 권한 보유)
+UAMI_NAME="mskr-aks-cluster-uami"
+UAMI_RG="AZ-AKS-RG"
+UAMI_CLIENT_ID="1cdb01c5-ab92-457a-b1a7-ce84cf1c8789"
+
+# 앱 환경변수
+FABRIC_BASE_URL="https://api.fabric.microsoft.com/v1/workspaces/e0d93e5a-6587-482d-91c0-2b0a489e6633/dataagents/587d71bb-6376-4d7f-ad5a-939836aeec12/aiassistant/openai"
+
+PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+# ── 구독 / 확장 / 프로바이더 ──────────────────────────────────
+echo "[1/8] 구독 설정 및 확장/프로바이더 등록..."
+az account set --subscription "$SUBSCRIPTION_ID"
+az extension add --name containerapp --upgrade --only-show-errors
+az provider register --namespace Microsoft.App --wait
+az provider register --namespace Microsoft.OperationalInsights --wait
+
+# ── 신규 Resource Group 생성 ─────────────────────────────────
+echo "[2/8] 신규 Resource Group 생성 (${RESOURCE_GROUP})..."
+az group create \
+  --name "$RESOURCE_GROUP" \
+  --location "$LOCATION" \
+  --only-show-errors -o none
+
+# ── UAMI 정보 조회 ───────────────────────────────────────────
+echo "[3/8] 기존 UAMI 정보 조회..."
+UAMI_ID=$(az identity show \
+  --name "$UAMI_NAME" --resource-group "$UAMI_RG" \
+  --query id -o tsv)
+UAMI_PRINCIPAL_ID=$(az identity show \
+  --name "$UAMI_NAME" --resource-group "$UAMI_RG" \
+  --query principalId -o tsv)
+echo "  UAMI: $UAMI_ID"
+
+# ── Docker 이미지 빌드 & ACR Push ───────────────────────────
+echo "[4/8] Docker 이미지 빌드 & ACR 푸시..."
+az acr login --name "$ACR_NAME"
+docker build -t "$IMAGE_REF" "$PROJECT_DIR"
+docker push "$IMAGE_REF"
+# (대안) 로컬 docker 없이 빌드:
+#   az acr build --registry "$ACR_NAME" --image "${IMAGE_NAME}:${IMAGE_TAG}" "$PROJECT_DIR"
+
+# ── ACR Pull 권한 부여 (UAMI → ACR) ─────────────────────────
+echo "[5/8] UAMI에 AcrPull 권한 부여..."
+ACR_ID=$(az acr show --name "$ACR_NAME" --query id -o tsv)
+az role assignment create \
+  --assignee-object-id "$UAMI_PRINCIPAL_ID" \
+  --assignee-principal-type ServicePrincipal \
+  --role AcrPull \
+  --scope "$ACR_ID" \
+  --only-show-errors -o none 2>/dev/null || echo "  AcrPull 권한 이미 존재함"
+
+# ── Container Apps Environment 생성 ─────────────────────────
+echo "[6/8] Container Apps Environment 생성 (${ENVIRONMENT})..."
+az containerapp env create \
+  --name "$ENVIRONMENT" \
+  --resource-group "$RESOURCE_GROUP" \
+  --location "$LOCATION" \
+  --only-show-errors -o none
+
+# ── Container App 생성/업데이트 ──────────────────────────────
+echo "[7/8] Container App 배포 (${APP_NAME})..."
+if az containerapp show --name "$APP_NAME" --resource-group "$RESOURCE_GROUP" -o none 2>/dev/null; then
+  echo "  기존 앱 업데이트..."
+  az containerapp update \
+    --name "$APP_NAME" \
+    --resource-group "$RESOURCE_GROUP" \
+    --image "$IMAGE_REF" \
+    --set-env-vars "AZURE_CLIENT_ID=$UAMI_CLIENT_ID" "FABRIC_BASE_URL=$FABRIC_BASE_URL" \
+    --only-show-errors -o none
+else
+  echo "  신규 앱 생성..."
+  az containerapp create \
+    --name "$APP_NAME" \
+    --resource-group "$RESOURCE_GROUP" \
+    --environment "$ENVIRONMENT" \
+    --image "$IMAGE_REF" \
+    --user-assigned "$UAMI_ID" \
+    --registry-server "$ACR_LOGIN_SERVER" \
+    --registry-identity "$UAMI_ID" \
+    --target-port "$TARGET_PORT" \
+    --ingress external \
+    --transport auto \
+    --min-replicas 1 \
+    --max-replicas 3 \
+    --cpu 0.5 --memory 1.0Gi \
+    --env-vars "AZURE_CLIENT_ID=$UAMI_CLIENT_ID" "FABRIC_BASE_URL=$FABRIC_BASE_URL" \
+    --only-show-errors -o none
+fi
+
+# ── URL 출력 ─────────────────────────────────────────────────
+echo "[8/8] 배포 완료, URL 조회..."
+FQDN=$(az containerapp show \
+  --name "$APP_NAME" \
+  --resource-group "$RESOURCE_GROUP" \
+  --query "properties.configuration.ingress.fqdn" -o tsv)
+
+echo ""
+echo "✅ 배포 완료!"
+echo "   URL: https://${FQDN}"

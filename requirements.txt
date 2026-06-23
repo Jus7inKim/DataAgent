@@ -1,0 +1,4 @@
+streamlit==1.43.2
+openai==1.70.0
+azure-identity==1.21.0
+pandas==2.2.3
