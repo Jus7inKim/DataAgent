@@ -1,0 +1,274 @@
+:root {
+  --bg: #f5f6f8;
+  --panel: #ffffff;
+  --border: #e2e4e9;
+  --primary: #0f6cbd;
+  --primary-dark: #0a5298;
+  --text: #1f2329;
+  --muted: #6b7280;
+  --user-bubble: #0f6cbd;
+  --assistant-bubble: #ffffff;
+  --error: #c2333b;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+}
+
+.app {
+  display: flex;
+  height: 100vh;
+}
+
+/* Sidebar */
+.sidebar {
+  width: 240px;
+  flex-shrink: 0;
+  background: var(--panel);
+  border-right: 1px solid var(--border);
+  padding: 20px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.sidebar h2 {
+  font-size: 15px;
+  margin: 0;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.meta {
+  font-size: 12px;
+}
+
+.meta-label {
+  color: var(--muted);
+  margin-bottom: 4px;
+}
+
+.meta code,
+.sidebar code {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 2px 6px;
+  font-size: 12px;
+  display: inline-block;
+}
+
+/* Main */
+.main {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.header {
+  padding: 16px 24px;
+  border-bottom: 1px solid var(--border);
+  background: var(--panel);
+}
+
+.header h1 {
+  font-size: 20px;
+  margin: 0;
+}
+
+.subtitle {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.banner.error {
+  margin: 12px 24px;
+  padding: 10px 14px;
+  background: #fdecee;
+  color: var(--error);
+  border: 1px solid #f5c2c7;
+  border-radius: 8px;
+  font-size: 13px;
+}
+
+/* Messages */
+.messages {
+  flex: 1;
+  overflow-y: auto;
+  padding: 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.empty {
+  color: var(--muted);
+  text-align: center;
+  margin-top: 40px;
+  font-size: 14px;
+}
+
+.message {
+  display: flex;
+}
+
+.message.user {
+  justify-content: flex-end;
+}
+
+.message.assistant {
+  justify-content: flex-start;
+}
+
+.bubble {
+  max-width: 90%;
+  border-radius: 12px;
+  padding: 12px 16px;
+  border: 1px solid var(--border);
+  background: var(--assistant-bubble);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.04);
+}
+
+.message.user .bubble {
+  background: var(--user-bubble);
+  color: #fff;
+  border-color: var(--user-bubble);
+}
+
+.text {
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+.text.error {
+  color: var(--error);
+}
+
+.text.loading {
+  color: var(--muted);
+}
+
+/* Data grid */
+.grid-wrapper {
+  margin-top: 10px;
+}
+
+.grid-meta {
+  font-size: 12px;
+  color: var(--muted);
+  margin-bottom: 6px;
+}
+
+.grid-scroll {
+  max-height: 460px;
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+
+.data-grid {
+  border-collapse: collapse;
+  width: 100%;
+  font-size: 13px;
+}
+
+.data-grid th,
+.data-grid td {
+  border-bottom: 1px solid var(--border);
+  border-right: 1px solid var(--border);
+  padding: 6px 10px;
+  text-align: left;
+  white-space: nowrap;
+}
+
+.data-grid thead th {
+  position: sticky;
+  top: 0;
+  background: #f0f2f5;
+  cursor: pointer;
+  user-select: none;
+  z-index: 1;
+}
+
+.data-grid tbody tr:nth-child(even) {
+  background: #fafbfc;
+}
+
+.data-grid .row-num {
+  color: var(--muted);
+  background: #f0f2f5;
+  text-align: right;
+  position: sticky;
+  left: 0;
+}
+
+.sort-ind {
+  font-size: 10px;
+}
+
+/* Composer */
+.composer {
+  display: flex;
+  gap: 8px;
+  padding: 16px 24px;
+  border-top: 1px solid var(--border);
+  background: var(--panel);
+}
+
+.composer input {
+  flex: 1;
+  padding: 10px 14px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  font-size: 14px;
+  outline: none;
+}
+
+.composer input:focus {
+  border-color: var(--primary);
+}
+
+.btn {
+  padding: 9px 16px;
+  border: 1px solid var(--border);
+  background: var(--panel);
+  border-radius: 8px;
+  font-size: 14px;
+  cursor: pointer;
+}
+
+.btn:hover:not(:disabled) {
+  background: var(--bg);
+}
+
+.btn.primary {
+  background: var(--primary);
+  color: #fff;
+  border-color: var(--primary);
+}
+
+.btn.primary:hover:not(:disabled) {
+  background: var(--primary-dark);
+}
+
+.btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}

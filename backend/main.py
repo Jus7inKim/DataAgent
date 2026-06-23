@@ -4,9 +4,18 @@ import json
 import uuid
 import typing as t
 import logging
+from pathlib import Path
+
 import pandas as pd
-import streamlit as st
-from azure.identity import WorkloadIdentityCredential, ManagedIdentityCredential, DefaultAzureCredential
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
+from azure.identity import (
+    WorkloadIdentityCredential,
+    ManagedIdentityCredential,
+    DefaultAzureCredential,
+)
 from openai import OpenAI
 from openai._models import FinalRequestOptions
 from openai._types import Omit
@@ -16,7 +25,6 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # ── 설정 ────────────────────────────────────────────────────
-# Fabric Portal에서 Publish 후 복사한 URL
 FABRIC_BASE_URL = os.getenv(
     "FABRIC_BASE_URL",
     "https://api.fabric.microsoft.com/v1/workspaces/"
@@ -33,14 +41,12 @@ POLL_TIMEOUT_SEC = 300
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "25"))
 MAX_BATCHES = int(os.getenv("MAX_BATCHES", "20"))
 
-# 첫 배치 요청 지시문 (표만, 설명/생략표시 없이)
 FIRST_BATCH_INSTRUCTION = (
     "\n\n[출력 규칙] 위 질문의 결과를 한 행도 빠짐없이 일관된 정렬 순서로 반환합니다. "
     "지금은 그중 처음 {n}건만 마크다운 표(헤더 포함)로만 출력하세요. "
     "표 이외의 설명, 요약, 생략 표시는 절대 넣지 마세요."
 )
 
-# 이어받기 배치 요청 지시문
 NEXT_BATCH_INSTRUCTION = (
     "직전 질문과 완전히 동일한 결과·정렬 순서를 기준으로, "
     "{start}번째 행부터 {end}번째 행까지를 이어서 마크다운 표(헤더 포함)로만 출력하세요. "
@@ -49,22 +55,31 @@ NEXT_BATCH_INSTRUCTION = (
 
 
 # ── 인증 ────────────────────────────────────────────────────
-@st.cache_resource
+_credential = None
+
+
 def get_credential():
-    """AKS Workload Identity → Managed Identity → DefaultAzureCredential 순 시도"""
+    """AKS Workload Identity → Managed Identity → DefaultAzureCredential 순 시도 (1회 캐시)"""
+    global _credential
+    if _credential is not None:
+        return _credential
+
     federated_token_file = os.getenv("AZURE_FEDERATED_TOKEN_FILE", "")
     if federated_token_file and os.path.exists(federated_token_file):
         logger.info("Using WorkloadIdentityCredential")
-        return WorkloadIdentityCredential()
+        _credential = WorkloadIdentityCredential()
+        return _credential
     try:
         cred = ManagedIdentityCredential(client_id=AZURE_CLIENT_ID)
         cred.get_token(FABRIC_SCOPE)
         logger.info("Using ManagedIdentityCredential")
-        return cred
+        _credential = cred
+        return _credential
     except Exception:
         pass
     logger.info("Using DefaultAzureCredential (local dev)")
-    return DefaultAzureCredential()
+    _credential = DefaultAzureCredential()
+    return _credential
 
 
 # ── Fabric OpenAI 클라이언트 ─────────────────────────────────
@@ -87,7 +102,6 @@ class FabricOpenAI(OpenAI):
             {**options.headers} if is_given(options.headers) else {}
         )
         options.headers = headers
-        # 매 요청마다 신선한 토큰 사용 (azure-identity 내부 캐시/갱신)
         token = self._credential.get_token(FABRIC_SCOPE).token
         headers["Authorization"] = f"Bearer {token}"
         if "Accept" not in headers:
@@ -101,30 +115,52 @@ def get_fabric_client() -> FabricOpenAI:
     return FabricOpenAI(credential=get_credential())
 
 
+# ── 세션 저장소 (인메모리) ───────────────────────────────────
+# session_id -> {"assistant_id": str, "thread_id": str}
+_sessions: dict[str, dict[str, str]] = {}
+
+
+def create_session() -> str:
+    client = get_fabric_client()
+    assistant = client.beta.assistants.create(model="not used")
+    thread = client.beta.threads.create()
+    session_id = str(uuid.uuid4())
+    _sessions[session_id] = {
+        "assistant_id": assistant.id,
+        "thread_id": thread.id,
+    }
+    logger.info(
+        "Session %s created (assistant=%s, thread=%s)",
+        session_id,
+        assistant.id,
+        thread.id,
+    )
+    return session_id
+
+
+def delete_session(session_id: str) -> None:
+    sess = _sessions.pop(session_id, None)
+    if not sess:
+        return
+    try:
+        client = get_fabric_client()
+        client.beta.threads.delete(thread_id=sess["thread_id"])
+        logger.info("Thread deleted: %s", sess["thread_id"])
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Thread 삭제 실패 (무시): %s", e)
+
+
 # ── Data Agent 호출 (Assistants API) ────────────────────────
-def ensure_session_ready(client: FabricOpenAI):
-    """세션당 assistant + thread 1회 생성 후 재사용 (대화 맥락 유지)"""
-    if "assistant_id" not in st.session_state:
-        assistant = client.beta.assistants.create(model="not used")
-        st.session_state.assistant_id = assistant.id
-        logger.info("Assistant created: %s", assistant.id)
-
-    if "thread_id" not in st.session_state:
-        thread = client.beta.threads.create()
-        st.session_state.thread_id = thread.id
-        logger.info("Thread created: %s", thread.id)
-
-
-def _ask_once(client, content: str):
+def _ask_once(client: FabricOpenAI, thread_id: str, assistant_id: str, content: str):
     """스레드에 메시지를 추가하고 Run을 실행한 뒤, 응답 텍스트와 run_id를 반환"""
     client.beta.threads.messages.create(
-        thread_id=st.session_state.thread_id,
+        thread_id=thread_id,
         role="user",
         content=content,
     )
     run = client.beta.threads.runs.create(
-        thread_id=st.session_state.thread_id,
-        assistant_id=st.session_state.assistant_id,
+        thread_id=thread_id,
+        assistant_id=assistant_id,
     )
 
     terminal_states = {"completed", "failed", "cancelled", "requires_action"}
@@ -133,19 +169,14 @@ def _ask_once(client, content: str):
         if time.time() - start_time > POLL_TIMEOUT_SEC:
             raise TimeoutError(f"응답 대기 시간 초과 ({POLL_TIMEOUT_SEC}초)")
         time.sleep(POLL_INTERVAL_SEC)
-        run = client.beta.threads.runs.retrieve(
-            thread_id=st.session_state.thread_id,
-            run_id=run.id,
-        )
+        run = client.beta.threads.runs.retrieve(thread_id=thread_id, run_id=run.id)
         logger.info("Run status: %s", run.status)
 
     if run.status != "completed":
         raise RuntimeError(f"Run 실패: {run.status}")
 
     messages = client.beta.threads.messages.list(
-        thread_id=st.session_state.thread_id,
-        order="desc",
-        limit=1,
+        thread_id=thread_id, order="desc", limit=1
     )
     answer_text = "응답을 찾을 수 없습니다."
     for msg in messages:
@@ -161,34 +192,39 @@ def _ask_once(client, content: str):
     return answer_text, run.id
 
 
-def call_data_agent(question: str) -> str:
+def call_data_agent(session_id: str, question: str) -> dict:
+    sess = _sessions.get(session_id)
+    if not sess:
+        raise KeyError(session_id)
+
     client = get_fabric_client()
-    ensure_session_ready(client)
+    thread_id = sess["thread_id"]
+    assistant_id = sess["assistant_id"]
 
     # ── 방안 B: 분할 출력 후 병합 ──────────────────────────────
-    # 1) 첫 배치 요청 (처음 BATCH_SIZE건을 표로만)
     first_prompt = question + FIRST_BATCH_INSTRUCTION.format(n=BATCH_SIZE)
-    first_text, first_run_id = _ask_once(client, first_prompt)
+    first_text, first_run_id = _ask_once(client, thread_id, assistant_id, first_prompt)
 
     frames = []
     df0 = parse_output_to_df(first_text)
     if df0 is not None and len(df0) > 0:
         frames.append(df0)
 
-    # 첫 배치가 표로 파싱되지 않으면(에이전트가 표 대신 거부/설명 응답) run step도 시도
     if not frames:
-        for item in extract_query_results(client, st.session_state.thread_id, first_run_id):
+        for item in extract_query_results(client, thread_id, first_run_id):
             d = parse_output_to_df(item.get("output"))
             if d is not None and len(d) > 0:
                 frames.append(d)
 
-    # 2) 첫 배치가 가득 찼으면 이어받기 배치 반복
     if frames and len(frames[-1]) >= BATCH_SIZE:
         for b in range(1, MAX_BATCHES):
             start = b * BATCH_SIZE + 1
             end = (b + 1) * BATCH_SIZE
             text, _ = _ask_once(
-                client, NEXT_BATCH_INSTRUCTION.format(start=start, end=end)
+                client,
+                thread_id,
+                assistant_id,
+                NEXT_BATCH_INSTRUCTION.format(start=start, end=end),
             )
             if "없음" in text and "|" not in text:
                 break
@@ -199,7 +235,6 @@ def call_data_agent(question: str) -> str:
             if len(df) < BATCH_SIZE:
                 break
 
-    # 3) 병합 + 중복 제거
     combined = None
     if frames:
         try:
@@ -209,23 +244,29 @@ def call_data_agent(question: str) -> str:
             logger.warning("배치 병합 실패: %s", e)
             combined = frames[0]
 
-    results = []
     if combined is not None and len(combined) > 0:
-        results.append({"query": None, "df": combined})
-        display_text = f"조회 결과 **{len(combined)}건**을 표로 표시합니다."
-    else:
-        display_text = first_text
+        payload = df_to_payload(combined)
+        return {
+            "text": f"조회 결과 {len(combined)}건을 표로 표시합니다.",
+            "columns": payload["columns"],
+            "rows": payload["rows"],
+        }
 
-    return {"text": display_text, "results": results}
+    # 표가 없으면 텍스트 답변에서 마크다운 표 폴백 파싱
+    fallback_df = _markdown_table_to_df(first_text)
+    if fallback_df is not None and len(fallback_df) > 0:
+        payload = df_to_payload(fallback_df)
+        return {
+            "text": f"조회 결과 {len(fallback_df)}건을 표로 표시합니다.",
+            "columns": payload["columns"],
+            "rows": payload["rows"],
+        }
 
+    return {"text": first_text, "columns": [], "rows": []}
 
 
 def extract_query_results(client, thread_id, run_id):
-    """Run step의 fabric_dataagent 툴 호출에서 실행된 쿼리와 전체 결과를 추출
-
-    openai SDK가 커스텀 'fabric_dataagent' step 타입을 파싱하면서 microsoft_fabric
-    필드가 누락될 수 있으므로, 원본 HTTP 응답(JSON)을 직접 읽는다.
-    """
+    """Run step의 툴 호출에서 실행된 쿼리와 전체 결과를 추출 (폴백)"""
     results = []
     try:
         raw = client.beta.threads.runs.steps.with_raw_response.list(
@@ -252,12 +293,6 @@ def extract_query_results(client, thread_id, run_id):
         logger.warning("Run step 응답 파싱 실패")
         return results
 
-    # 실제 run step 구조 확인용 (컨테이너 로그)
-    try:
-        logger.info("run steps raw: %s", json.dumps(payload, default=str)[:4000])
-    except Exception:  # noqa: BLE001
-        pass
-
     for step in payload.get("data") or []:
         details = step.get("step_details") or {}
         for tc in details.get("tool_calls") or []:
@@ -265,7 +300,6 @@ def extract_query_results(client, thread_id, run_id):
                 continue
             query, output = None, None
 
-            # (1) Foundry/Agent Service 래퍼: microsoft_fabric 필드
             mf = tc.get("microsoft_fabric")
             if tc.get("type") == "fabric_dataagent" or isinstance(mf, dict):
                 if isinstance(mf, dict):
@@ -277,11 +311,9 @@ def extract_query_results(client, thread_id, run_id):
                 else:
                     output = mf
 
-            # (2) Fabric aiassistant/openai 엔드포인트: function 툴 호출
             elif tc.get("type") == "function" and isinstance(tc.get("function"), dict):
                 fn = tc["function"]
                 name = str(fn.get("name") or "")
-                # fewshots 로딩 등 데이터가 아닌 보조 호출은 건너뜀
                 if "fewshots" in name.lower():
                     continue
                 output = fn.get("output")
@@ -297,7 +329,6 @@ def extract_query_results(client, thread_id, run_id):
 
             if not output:
                 continue
-            # 실제 표 데이터가 파싱되는 경우에만 그리드 후보로 채택
             df = parse_output_to_df(output)
             if df is not None and len(df) > 0:
                 results.append({"query": query, "output": output})
@@ -314,7 +345,6 @@ def _markdown_table_to_df(text):
         return [c.strip() for c in ln.strip().strip("|").split("|")]
 
     header = split_row(lines[0])
-    # 두 번째 줄이 구분선(---)이면 본문은 3번째부터
     sep_chars = set(lines[1].replace("|", "").replace(":", "").replace("-", "").strip())
     body = lines[2:] if not sep_chars else lines[1:]
     rows = [r for r in (split_row(ln) for ln in body) if len(r) == len(header)]
@@ -334,7 +364,6 @@ def parse_output_to_df(output):
         try:
             data = json.loads(text)
         except Exception:  # noqa: BLE001
-            # JSON이 아니면 마크다운 표 파싱 시도
             if "|" in text and "\n" in text:
                 return _markdown_table_to_df(text)
             return None
@@ -343,7 +372,6 @@ def parse_output_to_df(output):
     if isinstance(data, list):
         records = data
     elif isinstance(data, dict):
-        # columns + rows(2차원) 형태 우선 처리
         cols = data.get("columns")
         body = data.get("rows") if data.get("rows") is not None else data.get("data")
         if isinstance(cols, list) and isinstance(body, list) and body and isinstance(body[0], list):
@@ -365,118 +393,80 @@ def parse_output_to_df(output):
         return None
 
 
-def render_full_data(query_results, fallback_text=None):
-    """추출된 전체 쿼리 결과를 표(또는 원본)로 렌더링.
-
-    run step에서 구조화된 결과를 얻지 못하면, 답변 텍스트에 포함된
-    마크다운 표를 파싱해 그리드로 렌더링한다(폴백).
-    """
-    if not query_results:
-        if fallback_text:
-            df = _markdown_table_to_df(fallback_text)
-            if df is not None and len(df) > 0:
-                with st.expander(f"전체 데이터 ({len(df)}건)", expanded=True):
-                    height = min(len(df) + 1, 200) * 35 + 3
-                    st.dataframe(df, use_container_width=True, height=height)
-        return
-    for idx, item in enumerate(query_results):
-        # 이미 DataFrame으로 병합된 결과(방안 B)는 그대로 사용
-        df = item.get("df")
-        if df is None:
-            df = parse_output_to_df(item.get("output"))
-        if df is not None:
-            label = f"전체 데이터 ({len(df)}건)"
-        else:
-            label = "전체 데이터"
-        if len(query_results) > 1:
-            label = f"{label} #{idx + 1}"
-        with st.expander(label, expanded=True):
-            if item.get("query"):
-                st.caption("실행된 쿼리")
-                st.code(str(item["query"]))
-            if df is not None:
-                # 전체 행이 보이도록 행 수에 맞춰 높이 설정 (스크롤 없이 렌더링)
-                row_h = 35
-                height = min(len(df) + 1, 200) * row_h + 3
-                st.dataframe(df, use_container_width=True, height=height)
-            else:
-                raw = str(item.get("output", ""))
-                if "|" in raw and "\n" in raw:
-                    st.markdown(raw)
-                else:
-                    st.code(raw)
+def df_to_payload(df: pd.DataFrame) -> dict:
+    """DataFrame을 JSON 직렬화 가능한 {columns, rows(2차원)}로 변환"""
+    safe = df.astype(object).where(pd.notna(df), None)
+    return {
+        "columns": [str(c) for c in df.columns],
+        "rows": safe.values.tolist(),
+    }
 
 
-def reset_session():
-    """대화 초기화 - Fabric thread 삭제 후 세션 클리어"""
-    if "thread_id" in st.session_state:
-        try:
-            client = get_fabric_client()
-            client.beta.threads.delete(thread_id=st.session_state.thread_id)
-            logger.info("Thread deleted: %s", st.session_state.thread_id)
-        except Exception as e:
-            logger.warning("Thread 삭제 실패 (무시): %s", e)
-
-    for key in ["assistant_id", "thread_id", "messages"]:
-        st.session_state.pop(key, None)
+# ── FastAPI ──────────────────────────────────────────────────
+app = FastAPI(title="Fabric Data Agent API")
 
 
-# ──────────────────────────────────────────────────────────────
-# Streamlit UI
-# ──────────────────────────────────────────────────────────────
-st.set_page_config(
-    page_title="Fabric Data Agent",
-    page_icon="📊",
-    layout="wide",
-)
+class ChatRequest(BaseModel):
+    session_id: str
+    question: str
 
-st.title("📊 Microsoft Fabric Data Agent")
-st.caption("CosmosDB-Data-Agent2 · Azure Workload Identity · Assistants API")
 
-with st.sidebar:
-    st.header("설정")
-    if st.button("대화 초기화", type="secondary"):
-        reset_session()
-        st.rerun()
+class ResetRequest(BaseModel):
+    session_id: str
 
-    st.divider()
-    st.markdown("**Data Agent**")
-    agent_id = FABRIC_BASE_URL.split("/dataagents/")[1].split("/")[0]
-    st.code(f"ID: {agent_id[:8]}...", language=None)
-    st.markdown(f"**API Version**  \n`{API_VERSION}`")
 
-    if "thread_id" in st.session_state:
-        st.markdown("**Thread**")
-        st.code(st.session_state.thread_id[:16] + "...", language=None)
+@app.get("/api/health")
+@app.get("/_stcore/health")
+def health():
+    return {"status": "ok"}
 
-# 채팅 기록 초기화
-if "messages" not in st.session_state:
-    st.session_state.messages = []
 
-# 기존 대화 출력
-for message in st.session_state.messages:
-    with st.chat_message(message["role"]):
-        st.markdown(message["content"])
-        if message["role"] == "assistant":
-            render_full_data(message.get("results"), fallback_text=message["content"])
+@app.post("/api/session")
+def api_create_session():
+    try:
+        session_id = create_session()
+    except Exception as e:  # noqa: BLE001
+        logger.exception("세션 생성 실패")
+        raise HTTPException(status_code=500, detail=str(e))
+    return {"session_id": session_id}
 
-# 사용자 입력
-if prompt := st.chat_input("데이터에 대해 질문해 주세요..."):
-    st.session_state.messages.append({"role": "user", "content": prompt})
-    with st.chat_message("user"):
-        st.markdown(prompt)
 
-    with st.chat_message("assistant"):
-        with st.spinner("Fabric Data Agent가 분석 중..."):
-            try:
-                answer = call_data_agent(prompt)
-                st.markdown(answer["text"])
-                render_full_data(answer["results"], fallback_text=answer["text"])
-                st.session_state.messages.append({
-                    "role": "assistant",
-                    "content": answer["text"],
-                    "results": answer["results"],
-                })
-            except Exception as e:
-                logger.error("Data Agent 호출 실패: %s", e, exc_info=True)
-                st.error(f"오류: {e}")
+@app.post("/api/chat")
+def api_chat(req: ChatRequest):
+    if not req.question.strip():
+        raise HTTPException(status_code=400, detail="질문이 비어 있습니다.")
+    if req.session_id not in _sessions:
+        raise HTTPException(status_code=404, detail="세션을 찾을 수 없습니다. 새로고침하세요.")
+    try:
+        return call_data_agent(req.session_id, req.question)
+    except Exception as e:  # noqa: BLE001
+        logger.exception("Data Agent 호출 실패")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/session/reset")
+def api_reset(req: ResetRequest):
+    delete_session(req.session_id)
+    session_id = create_session()
+    return {"session_id": session_id}
+
+
+# ── 정적 React 빌드 서빙 ─────────────────────────────────────
+_STATIC_DIR = Path(__file__).parent / "static"
+if _STATIC_DIR.exists():
+    app.mount(
+        "/assets",
+        StaticFiles(directory=_STATIC_DIR / "assets"),
+        name="assets",
+    )
+
+    @app.get("/")
+    def index():
+        return FileResponse(_STATIC_DIR / "index.html")
+
+    @app.get("/{full_path:path}")
+    def spa_fallback(full_path: str):
+        candidate = _STATIC_DIR / full_path
+        if candidate.is_file():
+            return FileResponse(candidate)
+        return FileResponse(_STATIC_DIR / "index.html")
