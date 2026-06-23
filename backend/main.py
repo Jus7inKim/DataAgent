@@ -21,6 +21,14 @@ from openai._models import FinalRequestOptions
 from openai._types import Omit
 from openai._utils import is_given
 
+# Fabric Data Agent 전용 툴 호출 타입 (SDK 버전에 따라 없을 수 있어 방어적 임포트)
+try:
+    from openai.types.beta.threads.runs import (  # type: ignore
+        RunStepMicrosoftFabricToolCall,
+    )
+except Exception:  # noqa: BLE001
+    RunStepMicrosoftFabricToolCall = None  # type: ignore
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -196,24 +204,29 @@ def call_data_agent(session_id: str, question: str) -> dict:
     prompt = question + FULL_RESULT_INSTRUCTION
     text, run_id = _ask_once(client, thread_id, assistant_id, prompt)
 
-    # 2) 후보 프레임 수집 — 가장 행이 많은(전체에 가까운) 결과를 채택
-    candidates = []
-
-    # 2-a) 툴 호출의 원본 쿼리 결과(전체 행)를 최우선 후보로 사용
+    # 2) 후보 프레임 수집 — RAW 데이터(LLM 무관)를 최우선으로 채택
+    # 2-a) 툴 호출의 원본 RAW 결과(전체 행) — 검증 목적: LLM 응답과 무관하게 전체 데이터 확보
+    raw_frames = []
     for item in extract_query_results(client, thread_id, run_id):
         d = parse_output_to_df(item.get("output"))
         if d is not None and len(d) > 0:
-            candidates.append(d)
+            raw_frames.append(d)
 
-    # 2-b) 응답 텍스트(JSON/마크다운 표)도 후보로 추가
-    df_text = parse_output_to_df(text)
-    if df_text is not None and len(df_text) > 0:
-        candidates.append(df_text)
-    df_md = _markdown_table_to_df(text)
-    if df_md is not None and len(df_md) > 0:
-        candidates.append(df_md)
-
-    combined = max(candidates, key=len) if candidates else None
+    if raw_frames:
+        combined = max(raw_frames, key=len)
+        logger.info("RAW 데이터 채택: %s행 (LLM 응답과 무관)", len(combined))
+    else:
+        # 2-b) 폴백: RAW 결과를 얻지 못한 경우에만 LLM 응답 텍스트(JSON/마크다운 표) 사용
+        candidates = []
+        df_text = parse_output_to_df(text)
+        if df_text is not None and len(df_text) > 0:
+            candidates.append(df_text)
+        df_md = _markdown_table_to_df(text)
+        if df_md is not None and len(df_md) > 0:
+            candidates.append(df_md)
+        combined = max(candidates, key=len) if candidates else None
+        if combined is not None:
+            logger.info("폴백(LLM 응답) 데이터 채택: %s행", len(combined))
 
     if combined is not None and len(combined) > 0:
         payload = df_to_payload(combined)
@@ -227,8 +240,54 @@ def call_data_agent(session_id: str, question: str) -> dict:
 
 
 def extract_query_results(client, thread_id, run_id):
-    """Run step의 툴 호출에서 실행된 쿼리와 전체 결과를 추출 (폴백)"""
+    """Run step 툴 호출에서 실행된 쿼리와 전체 RAW 결과를 추출.
+
+    1순위: 타입드 SDK(RunStepMicrosoftFabricToolCall)로 microsoft_fabric['output']을
+           직접 획득 — LLM 응답과 무관한 원천 전체 데이터.
+    2순위: 원시 HTTP 응답(JSON) 파싱 폴백.
+    """
     results = []
+
+    # ── 1순위: 타입드 SDK 객체에서 RAW output 직접 추출 ──
+    try:
+        steps = client.beta.threads.runs.steps.list(
+            thread_id=thread_id,
+            run_id=run_id,
+            order="asc",
+        )
+        for step in steps:
+            details = getattr(step, "step_details", None)
+            for tool_call in getattr(details, "tool_calls", None) or []:
+                mf = getattr(tool_call, "microsoft_fabric", None)
+                is_fabric = (
+                    RunStepMicrosoftFabricToolCall is not None
+                    and isinstance(tool_call, RunStepMicrosoftFabricToolCall)
+                ) or mf is not None
+                if not is_fabric or mf is None:
+                    continue
+                # microsoft_fabric은 dict[str, str] 형태 (input / output)
+                if isinstance(mf, dict):
+                    executed_query = mf.get("input")
+                    full_output = mf.get("output")
+                else:
+                    executed_query = getattr(mf, "input", None)
+                    full_output = getattr(mf, "output", None)
+                if not full_output:
+                    continue
+                df = parse_output_to_df(full_output)
+                n_rows = len(df) if df is not None else 0
+                logger.info(
+                    "[검증] Fabric RAW output: %s행 (LLM 무관), query=%s",
+                    n_rows,
+                    executed_query,
+                )
+                results.append({"query": executed_query, "output": full_output})
+        if results:
+            return results
+    except Exception as e:  # noqa: BLE001
+        logger.warning("타입드 Run step 조회 실패, 원시 파싱으로 폴백: %s", e)
+
+    # ── 2순위: 원시 HTTP 응답(JSON) 파싱 폴백 ──
     try:
         raw = client.beta.threads.runs.steps.with_raw_response.list(
             thread_id=thread_id,
